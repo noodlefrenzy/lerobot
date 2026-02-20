@@ -35,7 +35,6 @@ from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
@@ -194,12 +193,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info(pformat(cfg.to_dict()))
 
-    # Initialize wandb only on main process
-    if cfg.wandb.enable and cfg.wandb.project and is_main_process:
-        wandb_logger = WandBLogger(cfg)
-    else:
-        wandb_logger = None
-        if is_main_process:
+    # Initialize experiment logger (wandb or mlflow) only on main process.
+    logger = None
+    if is_main_process:
+        if cfg.wandb.enable and cfg.wandb.project:
+            from lerobot.rl.wandb_utils import WandBLogger
+
+            logger = WandBLogger(cfg)
+        elif cfg.mlflow.enable:
+            from lerobot.rl.mlflow_utils import MLFlowLogger
+
+            logger = MLFlowLogger(cfg)
+        else:
             logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
     if cfg.seed is not None:
@@ -421,21 +426,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if is_log_step:
             logging.info(train_tracker)
-            if wandb_logger:
-                wandb_log_dict = train_tracker.to_dict()
+            if logger:
+                metrics_dict = train_tracker.to_dict()
                 if output_dict:
-                    wandb_log_dict.update(output_dict)
+                    metrics_dict.update(output_dict)
                 # Log RA-BC statistics if enabled
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()
-                    wandb_log_dict.update(
+                    metrics_dict.update(
                         {
                             "rabc_delta_mean": rabc_stats["delta_mean"],
                             "rabc_delta_std": rabc_stats["delta_std"],
                             "rabc_num_frames": rabc_stats["num_frames"],
                         }
                     )
-                wandb_logger.log_dict(wandb_log_dict, step)
+                logger.log_dict(metrics_dict, step)
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
@@ -453,8 +458,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     postprocessor=postprocessor,
                 )
                 update_last_checkpoint(checkpoint_dir)
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
+                if logger:
+                    logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
 
@@ -500,10 +505,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
-                if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                if logger:
+                    eval_metrics_dict = {**eval_tracker.to_dict(), **eval_info}
+                    logger.log_dict(eval_metrics_dict, step, mode="eval")
+                    logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
 
