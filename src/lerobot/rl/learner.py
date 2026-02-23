@@ -68,7 +68,6 @@ from lerobot.policies.factory import make_policy
 from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.rl.buffer import ReplayBuffer, concatenate_batch_transitions
 from lerobot.rl.process import ProcessSignalHandler
-from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.robots import so_follower  # noqa: F401
 from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
@@ -86,6 +85,7 @@ from lerobot.utils.constants import (
     PRETRAINED_MODEL_DIR,
     TRAINING_STATE_DIR,
 )
+from lerobot.utils.logger import MultiLogger, make_logger
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
@@ -150,13 +150,9 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     logging.info(f"Learner logging initialized, writing to {log_file}")
     logging.info(pformat(cfg.to_dict()))
 
-    # Setup WandB logging if enabled
-    if cfg.wandb.enable and cfg.wandb.project:
-        from lerobot.rl.wandb_utils import WandBLogger
-
-        wandb_logger = WandBLogger(cfg)
-    else:
-        wandb_logger = None
+    # Setup logging backends (wandb, mlflow, etc.)
+    logger = make_logger(cfg)
+    if not logger._backends:
         logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
     # Handle resume logic
@@ -170,16 +166,19 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     is_threaded = use_threads(cfg)
     shutdown_event = ProcessSignalHandler(is_threaded, display_pid=display_pid).shutdown_event
 
-    start_learner_threads(
-        cfg=cfg,
-        wandb_logger=wandb_logger,
-        shutdown_event=shutdown_event,
-    )
+    try:
+        start_learner_threads(
+            cfg=cfg,
+            logger=logger,
+            shutdown_event=shutdown_event,
+        )
+    finally:
+        logger.close()
 
 
 def start_learner_threads(
     cfg: TrainRLServerPipelineConfig,
-    wandb_logger: WandBLogger | None,
+    logger: MultiLogger,
     shutdown_event: any,  # Event,
 ) -> None:
     """
@@ -187,7 +186,7 @@ def start_learner_threads(
 
     Args:
         cfg (TrainRLServerPipelineConfig): Training configuration
-        wandb_logger (WandBLogger | None): Logger for metrics
+        logger (MultiLogger): Logger for metrics
         shutdown_event: Event to signal shutdown
     """
     # Create multiprocessing queues
@@ -221,7 +220,7 @@ def start_learner_threads(
 
     add_actor_information_and_train(
         cfg=cfg,
-        wandb_logger=wandb_logger,
+        logger=logger,
         shutdown_event=shutdown_event,
         transition_queue=transition_queue,
         interaction_message_queue=interaction_message_queue,
@@ -250,7 +249,7 @@ def start_learner_threads(
 
 def add_actor_information_and_train(
     cfg: TrainRLServerPipelineConfig,
-    wandb_logger: WandBLogger | None,
+    logger: MultiLogger,
     shutdown_event: any,  # Event,
     transition_queue: Queue,
     interaction_message_queue: Queue,
@@ -274,7 +273,7 @@ def add_actor_information_and_train(
 
     Args:
         cfg (TrainRLServerPipelineConfig): Configuration object containing hyperparameters.
-        wandb_logger (WandBLogger | None): Logger for tracking training progress.
+        logger (MultiLogger): Logger for tracking training progress.
         shutdown_event (Event): Event to signal shutdown.
         transition_queue (Queue): Queue for receiving transitions from the actor.
         interaction_message_queue (Queue): Queue for receiving interaction messages from the actor.
@@ -372,7 +371,7 @@ def add_actor_information_and_train(
         interaction_message = process_interaction_messages(
             interaction_message_queue=interaction_message_queue,
             interaction_step_shift=interaction_step_shift,
-            wandb_logger=wandb_logger,
+            logger=logger,
             shutdown_event=shutdown_event,
         )
 
@@ -561,8 +560,7 @@ def add_actor_information_and_train(
             training_infos["Optimization step"] = optimization_step
 
             # Log training metrics
-            if wandb_logger:
-                wandb_logger.log_dict(d=training_infos, mode="train", custom_step_key="Optimization step")
+            logger.log_dict(d=training_infos, mode="train", custom_step_key="Optimization step")
 
         # Calculate and log optimization frequency
         time_for_one_optimization_step = time.time() - time_for_one_optimization_step
@@ -571,15 +569,14 @@ def add_actor_information_and_train(
         logging.info(f"[LEARNER] Optimization frequency loop [Hz]: {frequency_for_one_optimization_step}")
 
         # Log optimization frequency
-        if wandb_logger:
-            wandb_logger.log_dict(
-                {
-                    "Optimization frequency loop [Hz]": frequency_for_one_optimization_step,
-                    "Optimization step": optimization_step,
-                },
-                mode="train",
-                custom_step_key="Optimization step",
-            )
+        logger.log_dict(
+            {
+                "Optimization frequency loop [Hz]": frequency_for_one_optimization_step,
+                "Optimization step": optimization_step,
+            },
+            mode="train",
+            custom_step_key="Optimization step",
+        )
 
         optimization_step += 1
         if optimization_step % log_freq == 0:
@@ -1109,7 +1106,7 @@ def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
 
 
 def process_interaction_message(
-    message, interaction_step_shift: int, wandb_logger: WandBLogger | None = None
+    message, interaction_step_shift: int, logger: MultiLogger | None = None
 ):
     """Process a single interaction message with consistent handling."""
     message = bytes_to_python_object(message)
@@ -1117,8 +1114,8 @@ def process_interaction_message(
     message["Interaction step"] += interaction_step_shift
 
     # Log if logger available
-    if wandb_logger:
-        wandb_logger.log_dict(d=message, mode="train", custom_step_key="Interaction step")
+    if logger:
+        logger.log_dict(d=message, mode="train", custom_step_key="Interaction step")
 
     return message
 
@@ -1169,7 +1166,7 @@ def process_transitions(
 def process_interaction_messages(
     interaction_message_queue: Queue,
     interaction_step_shift: int,
-    wandb_logger: WandBLogger | None,
+    logger: MultiLogger | None,
     shutdown_event: any,
 ) -> dict | None:
     """Process all available interaction messages from the queue.
@@ -1177,7 +1174,7 @@ def process_interaction_messages(
     Args:
         interaction_message_queue: Queue for receiving interaction messages
         interaction_step_shift: Amount to shift interaction step by
-        wandb_logger: Logger for tracking progress
+        logger: Logger for tracking progress
         shutdown_event: Event to signal shutdown
 
     Returns:
@@ -1189,7 +1186,7 @@ def process_interaction_messages(
         last_message = process_interaction_message(
             message=message,
             interaction_step_shift=interaction_step_shift,
-            wandb_logger=wandb_logger,
+            logger=logger,
         )
 
     return last_message
