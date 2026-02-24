@@ -50,6 +50,17 @@ class WandBConfig:
 
 
 @dataclass
+class MLflowConfig:
+    enable: bool = False
+    # Set to true to disable saving artifacts despite training.save_checkpoint=True
+    disable_artifact: bool = False
+    tracking_uri: str | None = None
+    experiment_name: str = "lerobot"
+    run_name: str | None = None
+    run_id: str | None = None
+
+
+@dataclass
 class EvalConfig:
     n_episodes: int = 50
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
