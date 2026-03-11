@@ -50,6 +50,16 @@ class WandBConfig:
 
 
 @dataclass
+class MLFlowConfig:
+    enable: bool = False
+    # Tracking server URI. Can be a local directory (e.g. 'mlruns') or a remote server URL.
+    tracking_uri: str | None = None
+    experiment_name: str = "lerobot"
+    run_name: str | None = None
+    run_id: str | None = None  # Set to resume a previous run
+
+
+@dataclass
 class EvalConfig:
     n_episodes: int = 50
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
